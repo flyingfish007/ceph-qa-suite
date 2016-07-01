@@ -387,6 +387,10 @@ def cluster(ctx, config):
                 iddevs = iddevs[len(roles_to_devs):]
             devs_to_clean[remote] = []
 
+        if len(roles_to_devs) == 0 and remote.os.name == 'opensuse':
+            config['conf']['global']['osd max object name len'] = '460'
+            config['conf']['global']['osd max object namespace len'] = '64'
+
         if config.get('block_journal'):
             log.info('block journal enabled')
             roles_to_journals = assign_devs(
