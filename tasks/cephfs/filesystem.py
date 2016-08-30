@@ -31,6 +31,93 @@ class ObjectNotFound(Exception):
     def __str__(self):
         return "Object not found: '{0}'".format(self._object_name)
 
+class FSStatus(object):
+    """
+    Operations on a snapshot of the FSMap.
+    """
+    def __init__(self, mon_manager):
+        self.mon = mon_manager
+        self.map = json.loads(self.mon.raw_cluster_cmd("fs", "dump", "--format=json-pretty"))
+
+    def __str__(self):
+        return json.dumps(self.map, indent = 2, sort_keys = True)
+
+    def __getitem__(self, key):
+        return self.map[key]
+
+    def get_filesystems(self):
+        """
+        """
+        for fs in self.map['filesystems']:
+            yield fs
+
+    def get_all(self):
+        """
+        Iterator for all the mds_info components in the FSMap.
+        """
+        for info in self.get_standbys():
+            yield info
+        for fs in self.map['filesystems']:
+            for info in fs['mdsmap']['info'].values():
+                yield info
+
+    def get_standbys(self):
+        """
+        Iterator for all standbys.
+        """
+        for info in self.map['standbys']:
+            yield info
+
+    def get_fsmap(self, fscid):
+        """
+        """
+        for fs in self.map['filesystems']:
+            if fscid is None or fs['id'] == fscid:
+                return fs
+        raise RuntimeError("FSCID {0} not in map".format(fscid))
+
+    def get_fsmap_byname(self, name):
+        """
+        """
+        for fs in self.map['filesystems']:
+            if name is None or fs['mdsmap']['fs_name'] == name:
+                return fs
+        raise RuntimeError("FS {0} not in map".format(name))
+
+    def get_replays(self, fscid):
+        fs = self.get_fsmap(fscid)
+        for info in fs['mdsmap']['info'].values():
+            if info['state'] == 'up:standby-replay':
+                yield info
+
+    def get_ranks(self, fscid):
+        fs = self.get_fsmap(fscid)
+        for info in fs['mdsmap']['info'].values():
+            if info['state'] == 'up:active':
+                yield info
+
+    def get_rank(self, fscid, rank):
+        for info in self.get_ranks(fscid):
+            if info['rank'] == rank:
+                return info
+        raise RuntimeError("FSCID {0} has no rank {1}".format(fscid, rank))
+
+    def get_mds(self, name):
+        for info in self.get_all():
+            if info['name'] == name:
+                return info
+        return None
+
+    def get_mds_addr(self, name):
+        """
+        Return the instance addr as a string, like "10.214.133.138:6807\/10825"
+        """
+        info = self.get_mds(name)
+        if info:
+            return info['addr']
+        else:
+            log.warn(json.dumps(list(self.get_all()), indent=2))  # dump for debugging
+            raise RuntimeError("MDS id '{0}' not found in map".format(name))
 
 class MDSCluster(object):
     """
@@ -109,18 +196,17 @@ class MDSCluster(object):
         that existed before the restart.
         """
         def _fail_restart(id_):
-            self.mds_daemons[id_].stop()
+            self.mds_daemons[id_].stop() # why doesn't mds_restart stop first?
             self.mon_manager.raw_cluster_cmd("mds", "fail", id_)
             self.mds_daemons[id_].restart()
 
         self._one_or_all(mds_id, _fail_restart)
 
     def get_filesystem(self, name):
-        return Filesystem(self._ctx, name)
+        return self.status().get_fsmap_byname(name)
 
-    def get_fs_map(self):
-        fs_map = json.loads(self.mon_manager.raw_cluster_cmd("fs", "dump", "--format=json-pretty"))
-        return fs_map
+    def status(self):
+        return FSStatus(self.mon_manager)
 
     def delete_all_filesystems(self):
         """
@@ -200,8 +286,9 @@ class MDSCluster(object):
 
         def set_block(_mds_id):
             remote = self.mon_manager.find_remote('mds', _mds_id)
+            status = self.status()
 
-            addr = self.get_mds_addr(_mds_id)
+            addr = status.get_mds_addr(_mds_id)
             ip_str, port_str, inst_str = re.match("(.+):(.+)/(.+)", addr).groups()
 
             remote.run(
@@ -216,61 +303,41 @@ class MDSCluster(object):
     def clear_firewall(self):
         clear_firewall(self._ctx)
 
-    def _all_info(self):
-        """
-        Iterator for all the mds_info components in the FSMap
-        """
-        fs_map = self.get_fs_map()
-        for i in fs_map['standbys']:
-            yield i
-        for fs in fs_map['filesystems']:
-            for i in fs['mdsmap']['info'].values():
-                yield i
-
-    def get_mds_addr(self, mds_id):
-        """
-        Return the instance addr as a string, like "10.214.133.138:6807\/10825"
-        """
-        for mds_info in self._all_info():
-            if mds_info['name'] == mds_id:
-                return mds_info['addr']
-
-        log.warn(json.dumps(list(self._all_info()), indent=2))  # dump for debugging
-        raise RuntimeError("MDS id '{0}' not found in map".format(mds_id))
-
     def get_mds_info(self, mds_id):
-        for mds_info in self._all_info():
-            if mds_info['name'] == mds_id:
-                return mds_info
-
-        return None
-
-    def get_mds_info_by_rank(self, mds_rank):
-        for mds_info in self._all_info():
-            if mds_info['rank'] == mds_rank:
-                return mds_info
-
-        return None
-
+        return FSStatus(self.mon_manager).get_mds(mds_id)
 
 class Filesystem(MDSCluster):
     """
     This object is for driving a CephFS filesystem.  The MDS daemons driven by
     MDSCluster may be shared with other Filesystems.
     """
-    def __init__(self, ctx, name=None):
+    def __init__(self, ctx, fscid=None):
         super(Filesystem, self).__init__(ctx)
 
-        if name is None:
-            name = "cephfs"
+        self.id = fscid
 
-        self.name = name
-        self.metadata_pool_name = "{0}_metadata".format(name)
-        self.data_pool_name = "{0}_data".format(name)
+        if self.id is not None:
+            fsmap = self.status().get_fsmap(self.id)
+            self.name = fsmap['mdsmap']['fs_name']
+        else:
+            self.name = "cephfs"
+
+        self.metadata_pool_name = "{0}_metadata".format(self.name)
+        self.data_pool_name = "{0}_data".format(self.name)
 
         client_list = list(misc.all_roles_of_type(self._ctx.cluster, 'client'))
         self.client_id = client_list[0]
         self.client_remote = list(misc.get_clients(ctx=ctx, roles=["client.{0}".format(self.client_id)]))[0][1]
+
+    def deactivate(self, rank):
+        if rank < 0:
+            raise RuntimeError("invalid rank")
+        elif rank == 0:
+            raise RuntimeError("cannot deactivate rank 0")
+        self.mon_manager.raw_cluster_cmd("mds", "deactivate", "%d:%d" % (self.id, rank))
+
+    def set_max_mds(self, max_mds):
+        self.mon_manager.raw_cluster_cmd("fs", "set", self.name, "max_mds", "%d" % max_mds)
 
     def get_pgs_per_fs_pool(self):
         """
@@ -282,9 +349,6 @@ class Filesystem(MDSCluster):
         pg_warn_min_per_osd = int(self.get_config('mon_pg_warn_min_per_osd'))
         osd_count = len(list(misc.all_roles_of_type(self._ctx.cluster, 'osd')))
         return pg_warn_min_per_osd * osd_count
-
-    def get_all_mds_info(self):
-        return self.get_mds_info()
 
     def create(self):
         log.info("Creating filesystem '{0}'".format(self.name))
@@ -328,8 +392,7 @@ class Filesystem(MDSCluster):
         return json.loads(self.mon_manager.raw_cluster_cmd("df", "--format=json-pretty"))
 
     def get_mds_map(self):
-        fs = json.loads(self.mon_manager.raw_cluster_cmd("fs", "get", self.name, "--format=json-pretty"))
-        return fs['mdsmap']
+        return self.status().get_fsmap(self.id)['mdsmap']
 
     def get_data_pool_name(self):
         return self.data_pool_name
@@ -346,8 +409,7 @@ class Filesystem(MDSCluster):
         return self.metadata_pool_name
 
     def get_namespace_id(self):
-        fs = json.loads(self.mon_manager.raw_cluster_cmd("fs", "get", self.name, "--format=json-pretty"))
-        return fs['id']
+        return self.id
 
     def get_pool_df(self, pool_name):
         """
@@ -605,15 +667,15 @@ class Filesystem(MDSCluster):
 
         started_at = time.time()
         while True:
+            status = self.status()
             if mds_id is not None:
                 # mds_info is None if no daemon with this ID exists in the map
-                mds_info = self.mon_manager.get_mds_status(mds_id)
+                mds_info = status.get_mds(mds_id)
                 current_state = mds_info['state'] if mds_info else None
                 log.info("Looked up MDS state for {0}: {1}".format(mds_id, current_state))
             else:
                 # In general, look for a single MDS
-                mds_status = self.get_mds_map()
-                states = [m['state'] for m in mds_status['info'].values()]
+                states = [m['state'] for m in status.get_ranks(self.id)]
                 if [s for s in states if s == goal_state] == [goal_state]:
                     current_state = goal_state
                 elif reject in states:
@@ -629,7 +691,7 @@ class Filesystem(MDSCluster):
             elif reject is not None and current_state == reject:
                 raise RuntimeError("MDS in reject state {0}".format(current_state))
             elif timeout is not None and elapsed > timeout:
-                log.error("MDS status at timeout: {0}".format(self.get_mds_map()))
+                log.error("MDS status at timeout: {0}".format(status.get_fsmap(self.id)))
                 raise RuntimeError(
                     "Reached timeout after {0} seconds waiting for state {1}, while in state {2}".format(
                         elapsed, goal_state, current_state
