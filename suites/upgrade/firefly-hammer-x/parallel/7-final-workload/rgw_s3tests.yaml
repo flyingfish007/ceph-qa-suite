@@ -3,6 +3,7 @@ tasks:
 - s3tests:
     client.1:
       rgw_server: client.1
+      force-branch: rgw-lifecycle-testing
 overrides:
   ceph:
     conf:
