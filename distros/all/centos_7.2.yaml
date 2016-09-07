@@ -1,2 +1,6 @@
+overrides:
+  ansible.cephlab:
+    repo: https://github.com/rjfd/ceph-cm-ansible
+    branch: wip-opensuse-upstream-pr
 os_type: centos
 os_version: "7.2"
