@@ -101,10 +101,10 @@ class MDSThrasher(Greenlet):
         self.stopping = Event()
 
         self.randomize = bool(self.config.get('randomize', True))
+        self.thrash_max_mds = float(self.config.get('thrash_max_mds', 0.25))
         self.max_thrash = int(self.config.get('max_thrash', 1))
-        self.max_thrash_delay = float(self.config.get('thrash_delay', 60.0))
+        self.max_thrash_delay = float(self.config.get('thrash_delay', 120.0))
         self.thrash_in_replay = float(self.config.get('thrash_in_replay', False))
-        self.thrash_max_mds = float(self.config.get('thrash_max_mds', 0.80))
         assert self.thrash_in_replay >= 0.0 and self.thrash_in_replay <= 1.0, 'thrash_in_replay ({v}) must be between [0.0, 1.0]'.format(
             v=self.thrash_in_replay)
         self.max_replay_thrash_delay = float(self.config.get('max_replay_thrash_delay', 4.0))
@@ -161,8 +161,31 @@ class MDSThrasher(Greenlet):
             args.extend(['--hot-standby', standby_for_rank])
         self.ctx.daemons.get_daemon('mds', mds).restart(*args)
 
-    def get_mds_status_all(self):
-        return self.fs.get_mds_map()
+    def wait_for_stable(self, rank = None, gid = None):
+        self.log('waiting for mds cluster to stabilize...')
+        status = self.fs.status()
+        itercount = 0
+        while True:
+            max_mds = status.get_fsmap(self.fs.id)['mdsmap']['max_mds']
+            if rank is not None:
+                try:
+                    info = status.get_rank(self.fs.id, rank)
+                    if info['gid'] != gid:
+                        self.log('mds.{name} has gained rank={rank}, replacing gid={gid}'.format(name = info['name'], rank = rank, gid = gid))
+                        return status, info['name']
+                except:
+                    pass # no rank present
+            else:
+                ranks = filter(lambda info: "up:active" == info['state'] and "laggy_since" not in info, list(status.get_ranks(self.fs.id)))
+                count = len(ranks)
+                if count >= max_mds:
+                    self.log('mds cluster has {count} alive and active, now stable!'.format(count = count))
+                    return status, None
+            itercount = itercount + 1
+            if itercount > 10:
+                self.log('mds map: {status}'.format(status=self.fs.status()))
+            time.sleep(2)
+            status = self.fs.status()
 
     def do_thrash(self):
         """
@@ -203,7 +226,7 @@ class MDSThrasher(Greenlet):
                         self.fs.deactivate(rank)
                         stats['deactivate'] += 1
 
-                    status = self.fs.status()
+                    status = self.wait_for_stable()[0]
 
             count = 0
             for info in status.get_ranks(self.fs.id):
@@ -258,22 +281,7 @@ class MDSThrasher(Greenlet):
                     self.log('{label} down, removed from mdsmap'.format(label=label, since=last_laggy_since))
 
                 # wait for a standby mds to takeover and become active
-                takeover_mds = None
-                itercount = 0
-                while True:
-                    status = self.fs.status()
-                    try:
-                        info = status.get_rank(self.fs.id, rank)
-                        if info['gid'] != gid:
-                            takeover_mds = name
-                            break
-                    except:
-                        pass # no rank present
-                    itercount = itercount + 1
-                    if itercount > 10:
-                        self.log('mds map: {status}'.format(status=self.fs.status()))
-                    time.sleep(2)
-
+                status, takeover_mds = self.wait_for_stable(rank, gid)
                 self.log('New active mds is mds.{_id}'.format(_id=takeover_mds))
 
                 # wait for a while before restarting old active to become new
